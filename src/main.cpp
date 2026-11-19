@@ -38,8 +38,10 @@ constexpr uintptr_t RVA_GUI_Label      = 0x2AC90AC;
 constexpr uintptr_t RVA_GUI_Button     = 0x2ACA814;
 constexpr uintptr_t RVA_GUI_set_matrix = 0x2AC9024;
 
-// Set after reading logcat (filter "TeddyMod") when you place the teddy. "Teddy" is a guess.
-static const char *TEDDY_TAG = "Teddy";
+// Leave "" for testing: the menu opens when ANYTHING enters the cradle trigger and shows the tag
+// of what entered on screen. Once you know the teddy's tag, put it here (e.g. "Teddy").
+static const char *TEDDY_TAG = "";
+static char g_lastTag[64] = "(none yet)";
 
 static std::atomic<bool> g_teddyPlaced{false};
 static std::atomic<bool> g_showMenu{false};
@@ -108,8 +110,9 @@ static void (*orig_OnTriggerEnter)(void *, void *, const void *) = nullptr;
 static void hook_OnTriggerEnter(void *self, void *other, const void *mi) {
     if (self && other) {
         std::string tag = il2cppToStd(get_tag(other, nullptr));
-        LOG("teddyInVagga.OnTriggerEnter other.tag='%s'", tag.c_str());   // read once in logcat
-        if (tag == TEDDY_TAG) {
+        LOG("teddyInVagga.OnTriggerEnter other.tag='%s'", tag.c_str());
+        snprintf(g_lastTag, sizeof g_lastTag, "%s", tag.c_str());
+        if (TEDDY_TAG[0] == 0 || tag == TEDDY_TAG) {
             g_teddyPlaced = true;
             g_showMenu    = true;
             ensureHost(self);
@@ -124,14 +127,17 @@ static void DrawMenu() {
     Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = s; sc.m[15] = 1.0f;
     GUI_set_matrix(sc, nullptr);
 
-    GUI_Box(Rect{40, 40, 300, 230}, Str("Mod Menu"), nullptr);
+    GUI_Box(Rect{40, 40, 300, 245}, Str("Mod Menu"), nullptr);
     GUI_Label(Rect{55, 70, 270, 30}, Str(g_teddyPlaced ? "Teddy placed: YES" : "Teddy placed: NO"), nullptr);
 
+    std::string t = std::string("Last tag: ") + g_lastTag;      // shows what entered the trigger
+    GUI_Label(Rect{55, 90, 270, 30}, Str(t.c_str()), nullptr);
+
     static bool example = false;
-    if (GUI_Button(Rect{55, 110, 270, 50}, Str(example ? "Example: ON" : "Example: OFF"), nullptr))
+    if (GUI_Button(Rect{55, 125, 270, 50}, Str(example ? "Example: ON" : "Example: OFF"), nullptr))
         example = !example;                           // add your features here
 
-    if (GUI_Button(Rect{55, 190, 270, 50}, Str("Close"), nullptr))
+    if (GUI_Button(Rect{55, 200, 270, 50}, Str("Close"), nullptr))
         g_showMenu = false;                           // reappears next time the teddy is placed
 
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
