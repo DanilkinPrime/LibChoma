@@ -14,6 +14,9 @@ jobs:
         run: |
           git clone https://github.com/jmpews/Dobby.git Dobby
           git -C Dobby checkout e9fe7fb
+          # this Dobby version defines Logger::Shared() non-inline in a header -> duplicate symbols
+          sed -i 's/^Logger \*Logger::Shared()/inline Logger *Logger::Shared()/' Dobby/external/logging/logging/logging.h
+          grep -n 'Logger::Shared' Dobby/external/logging/logging/logging.h
 
       - name: Configure (arm64-v8a)
         run: |
@@ -24,7 +27,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build --target teddymod
 
       - name: Upload lib
         uses: actions/upload-artifact@v4
