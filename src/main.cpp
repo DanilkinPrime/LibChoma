@@ -1,9 +1,9 @@
 // teddy_unitygui.cpp - arm64 il2cpp (Slendrina): Dobby + Unity's built-in IMGUI (GUI.Box/Label/Button)
-// Menu appears when the teddy is placed. No ImGui, no EGL hook, touch works through Unity itself.
+// Menu appears when the teddy is placed. Speed selector: 1x / 2x / 3x (Time.timeScale). FPS counter hidden.
 //
-// Unity GUI calls only work inside an OnGUI() callback. We have no OnGUI of our own, so we
-// borrow the game's own FPSDisplay.OnGUI: when the teddy is placed we AddComponent(FPSDisplay)
-// onto the teddy object (guarantees one exists) and hook its OnGUI to draw the menu.
+// Unity GUI calls only work inside an OnGUI() callback. We borrow the game's own FPSDisplay.OnGUI:
+// when the teddy is placed we AddComponent(FPSDisplay) onto the teddy object (guarantees one exists)
+// and hook its OnGUI to draw the menu. The original FPSDisplay.OnGUI is never called -> FPS is hidden.
 //
 // RVAs from your dump.cs:
 //   teddyInVagga.OnTriggerEnter = 0x15531F8      FPSDisplay.OnGUI        = 0x144D828
@@ -11,6 +11,7 @@
 //   GameObject.AddComponent(Type)= 0x2A9DEB0     Screen.get_height       = 0x2A76984
 //   GUI.Box(Rect,string)        = 0x2ACA434      GUI.Label(Rect,string)  = 0x2AC90AC
 //   GUI.Button(Rect,string)     = 0x2ACA814      GUI.set_matrix(Matrix4x4)= 0x2AC9024
+//   Time.set_timeScale(float)   = 0x2AA61C0
 //
 // Link: -llog -ldl     Hook lib: Dobby
 
@@ -37,15 +38,17 @@ constexpr uintptr_t RVA_GUI_Box        = 0x2ACA434;
 constexpr uintptr_t RVA_GUI_Label      = 0x2AC90AC;
 constexpr uintptr_t RVA_GUI_Button     = 0x2ACA814;
 constexpr uintptr_t RVA_GUI_set_matrix = 0x2AC9024;
+constexpr uintptr_t RVA_set_timeScale  = 0x2AA61C0;
 
 // Leave "" for testing: the menu opens when ANYTHING enters the cradle trigger and shows the tag
 // of what entered on screen. Once you know the teddy's tag, put it here (e.g. "Teddy").
-static const char *TEDDY_TAG = "";
+static const char *TEDDY_TAG = "teddy";
 static char g_lastTag[64] = "(none yet)";
 
 static std::atomic<bool> g_teddyPlaced{false};
 static std::atomic<bool> g_showMenu{false};
 static bool g_hostAdded = false;
+static int  g_speed = 1;                              // 1, 2 or 3
 
 // ---------------------------------------------------------------- types
 struct Rect { float x, y, w, h; };
@@ -59,6 +62,7 @@ static void  (*GUI_Box)(Rect, void *, const void *)      = nullptr;
 static void  (*GUI_Label)(Rect, void *, const void *)    = nullptr;
 static bool  (*GUI_Button)(Rect, void *, const void *)    = nullptr;
 static void  (*GUI_set_matrix)(Matrix4x4, const void *)  = nullptr;
+static void  (*set_timeScale)(float)                     = nullptr;
 
 // il2cpp exports (resolved with dlsym)
 static void *(*il2cpp_domain_get)()                                  = nullptr;
@@ -105,6 +109,12 @@ static void ensureHost(void *teddyBehaviour) {
     if (go && typeObj) { AddComponent(go, typeObj, nullptr); g_hostAdded = true; LOG("host component added"); }
 }
 
+static void setSpeed(int s) {
+    g_speed = s;
+    set_timeScale((float)s);
+    LOG("timeScale -> %d", s);
+}
+
 // ---------------------------------------------------------------- hooks
 static void (*orig_OnTriggerEnter)(void *, void *, const void *) = nullptr;
 static void hook_OnTriggerEnter(void *self, void *other, const void *mi) {
@@ -133,11 +143,19 @@ static void DrawMenu() {
     std::string t = std::string("Last tag: ") + g_lastTag;      // shows what entered the trigger
     GUI_Label(Rect{55, 90, 270, 30}, Str(t.c_str()), nullptr);
 
-    static bool example = false;
-    if (GUI_Button(Rect{55, 125, 270, 50}, Str(example ? "Example: ON" : "Example: OFF"), nullptr))
-        example = !example;                           // add your features here
+    std::string sp = "Speed: x" + std::to_string(g_speed);
+    GUI_Label(Rect{55, 125, 270, 30}, Str(sp.c_str()), nullptr);
 
-    if (GUI_Button(Rect{55, 200, 270, 50}, Str("Close"), nullptr))
+    // speed selector: 1x / 2x / 3x (selected one shown in brackets)
+    static const char *names[3]  = {"1x", "2x", "3x"};
+    static const char *namesOn[3] = {"[1x]", "[2x]", "[3x]"};
+    for (int i = 0; i < 3; i++) {
+        Rect r{55.0f + i * 92.0f, 150, 85, 40};
+        if (GUI_Button(r, Str(g_speed == i + 1 ? namesOn[i] : names[i]), nullptr))
+            setSpeed(i + 1);
+    }
+
+    if (GUI_Button(Rect{55, 215, 270, 50}, Str("Close"), nullptr))
         g_showMenu = false;                           // reappears next time the teddy is placed
 
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
@@ -147,7 +165,7 @@ static void DrawMenu() {
 static void (*orig_FPS_OnGUI)(void *, const void *) = nullptr;
 static void hook_FPS_OnGUI(void *self, const void *mi) {
     if (g_showMenu) DrawMenu();                       // we are inside an OnGUI call here
-    orig_FPS_OnGUI(self, mi);
+    // orig_FPS_OnGUI intentionally NOT called -> FPS counter is hidden
 }
 
 // ---------------------------------------------------------------- init
@@ -174,6 +192,7 @@ static void *init_thread(void *) {
     GUI_Label      = (decltype(GUI_Label))(base + RVA_GUI_Label);
     GUI_Button     = (decltype(GUI_Button))(base + RVA_GUI_Button);
     GUI_set_matrix = (decltype(GUI_set_matrix))(base + RVA_GUI_set_matrix);
+    set_timeScale  = (decltype(set_timeScale))(base + RVA_set_timeScale);
 
     DobbyHook((void *)(base + RVA_OnTriggerEnter), (void *)hook_OnTriggerEnter, (void **)&orig_OnTriggerEnter);
     DobbyHook((void *)(base + RVA_FPS_OnGUI),      (void *)hook_FPS_OnGUI,      (void **)&orig_FPS_OnGUI);
