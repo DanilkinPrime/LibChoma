@@ -32,6 +32,10 @@
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "TeddyMod", __VA_ARGS__)
 
+// on-screen status line (shown in the menu) - so you can debug without logcat
+static char g_status[300] = "status: idle";
+#define STATUS(...) do { snprintf(g_status, sizeof g_status, __VA_ARGS__); LOG("%s", g_status); } while (0)
+
 constexpr uintptr_t RVA_OnTriggerEnter = 0x15531F8;
 constexpr uintptr_t RVA_FPS_OnGUI      = 0x144D828;
 constexpr uintptr_t RVA_get_tag        = 0x2A9ACD0;
@@ -166,37 +170,37 @@ static bool LoadTexture() {
     };
     std::vector<char> bytes;
     for (auto &p : cands)
-        if (readFile(p, bytes)) { LOG("image read: %s (%zu bytes)", p.c_str(), bytes.size()); break; }
-    if (bytes.empty()) { LOG("image file not found (tried %s ...)", cands[0].c_str()); return false; }
+        if (readFile(p, bytes)) { STATUS("1 file read OK %zu B: %s", bytes.size(), p.c_str()); break; }
+    if (bytes.empty()) { STATUS("FAIL: file not found/empty. pkg='%s' tried: %s", pkg.c_str(), cands[0].c_str()); return false; }
 
     if (!il2cpp_object_new || !il2cpp_array_new || !il2cpp_get_corlib || !il2cpp_class_get_method_from_name) {
-        LOG("missing il2cpp exports for texture loading");
+        STATUS("FAIL: il2cpp exports missing (object_new/array_new/get_corlib/get_method_from_name)");
         return false;
     }
 
     // byte[] with the file contents (arm64: array data starts at +0x20)
     void *byteK = il2cpp_class_from_name(il2cpp_get_corlib(), "System", "Byte");
-    if (!byteK) { LOG("System.Byte not found"); return false; }
+    if (!byteK) { STATUS("FAIL: System.Byte class not found"); return false; }
     void *arr = il2cpp_array_new(byteK, bytes.size());
-    if (!arr) return false;
+    if (!arr) { STATUS("FAIL: byte[] alloc"); return false; }
     memcpy((char *)arr + 0x20, bytes.data(), bytes.size());
 
     // new Texture2D(2, 2)
     void *coreImg = ImageOf("UnityEngine.CoreModule");
     void *texK    = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Texture2D") : nullptr;
-    if (!texK) { LOG("Texture2D class not found"); return false; }
+    if (!texK) { STATUS("FAIL: Texture2D class not found"); return false; }
     void *ctorMI = nullptr;
     void *ctor = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", ".ctor", 2, &ctorMI);
     void *tex = il2cpp_object_new(texK);
-    if (!ctor || !tex) return false;
+    if (!ctor || !tex) { STATUS("FAIL: Texture2D ctor(int,int) not found"); return false; }
     ((void (*)(void *, int, int, const void *))ctor)(tex, 2, 2, ctorMI);
 
     // ImageConversion.LoadImage(tex, bytes)
     void *liMI = nullptr;
     void *li = MethodOf("UnityEngine.ImageConversionModule", "UnityEngine", "ImageConversion", "LoadImage", 2, &liMI);
-    if (!li) return false;
+    if (!li) { STATUS("FAIL: ImageConversion.LoadImage not found (module stripped?)"); return false; }
     bool ok = ((bool (*)(void *, void *, const void *))li)(tex, arr, liMI);
-    if (!ok) { LOG("LoadImage failed (bad image file?)"); return false; }
+    if (!ok) { STATUS("FAIL: LoadImage returned false (bad PNG/JPG?)"); return false; }
 
     // keep it alive: HideAndDontSave + GC handle
     void *hfMI = nullptr;
@@ -205,7 +209,7 @@ static bool LoadTexture() {
     if (il2cpp_gchandle_new) il2cpp_gchandle_new(tex, false);
 
     g_tex = tex;
-    LOG("texture created");
+    STATUS("2 texture OK (%zu B file)", bytes.size());
     return true;
 }
 
@@ -217,6 +221,8 @@ static int ScreenWidth() {
 
 static void DrawScare() {
     if (!g_tex) return;
+    static bool said = false;
+    if (!said) { STATUS("3 drawing image (DrawTexture)"); said = true; }
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
     GUI_set_matrix(id, nullptr);                      // no scaling: use real screen pixels
     Rect full{0, 0, (float)ScreenWidth(), (float)Screen_height(nullptr)};
@@ -265,7 +271,7 @@ static void DrawMenu() {
     Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = s; sc.m[15] = 1.0f;
     GUI_set_matrix(sc, nullptr);
 
-    GUI_Box(Rect{40, 40, 300, 310}, Str("Mod Menu"), nullptr);
+    GUI_Box(Rect{40, 40, 300, 420}, Str("Mod Menu"), nullptr);
     GUI_Label(Rect{55, 70, 270, 30}, Str(g_teddyPlaced ? "Teddy placed: YES" : "Teddy placed: NO"), nullptr);
 
     std::string t = std::string("Last tag: ") + g_lastTag;      // shows what entered the trigger
@@ -290,6 +296,8 @@ static void DrawMenu() {
 
     if (GUI_Button(Rect{55, 280, 270, 50}, Str("Close"), nullptr))
         g_showMenu = false;                           // reappears next time the teddy is placed
+
+    GUI_Label(Rect{55, 340, 270, 110}, Str(g_status), nullptr);   // debug status (word-wrapped)
 
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
     GUI_set_matrix(id, nullptr);                      // restore so the game's own GUI isn't scaled
