@@ -11,5 +11,5 @@ add_subdirectory(Dobby)
 
 add_library(teddymod SHARED src/main.cpp)
 target_include_directories(teddymod PRIVATE Dobby/include)
-target_link_libraries(teddymod dobby_static log dl)
+target_link_libraries(teddymod dobby_static log dl z)
 set_target_properties(teddymod PROPERTIES CXX_VISIBILITY_PRESET hidden)
