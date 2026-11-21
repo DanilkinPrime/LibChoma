@@ -3,6 +3,8 @@
 //   * Speed selector 1x / 2x / 3x (Time.timeScale), FPS counter hidden
 //   * "Show image" button -> full-screen image (jumpscare) for 1.5 seconds, loaded from a file
 //
+// Images are read from the APK's assets/ folder (assets/jumpscare.png, assets/lisovskiy.png)
+// or, if present, from the game's files folder (checked first, handy for testing):
 // Image file (PNG/JPG), put it in the game's own files folder (no permission needed):
 //   /sdcard/Android/data/<package>/files/jumpscare.png
 // (also tried: /data/data/<package>/files/jumpscare.png)
@@ -35,8 +37,10 @@
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "TeddyMod", __VA_ARGS__)
 
 // on-screen status line (shown in the menu) - so you can debug without logcat
-static char g_status[300] = "status: idle";
-#define STATUS(...) do { snprintf(g_status, sizeof g_status, __VA_ARGS__); LOG("%s", g_status); } while (0)
+static char g_status[300]  = "image: idle";
+static char g_status2[300] = "skin: idle";
+static char *g_st = g_status;                        // which line STATUS() currently writes to
+#define STATUS(...) do { snprintf(g_st, 300, __VA_ARGS__); LOG("%s", g_st); } while (0)
 
 constexpr uintptr_t RVA_OnTriggerEnter = 0x15531F8;
 constexpr uintptr_t RVA_FPS_OnGUI      = 0x144D828;
@@ -157,6 +161,114 @@ static bool readFile(const std::string &path, std::vector<char> &out) {
     return got == (size_t)n;
 }
 
+// ---------------------------------------------------------------- read assets/<name> from the installed APK
+// (an APK is a zip: find the entry in the central directory and unpack it with zlib)
+// APK_BEGIN
+static bool zipRead(const std::string &apk, const std::string &entry, std::vector<char> &out) {
+    FILE *f = fopen(apk.c_str(), "rb");
+    if (!f) return false;
+    auto u16 = [](const uint8_t *p) { return (uint32_t)(p[0] | p[1] << 8); };
+    auto u32 = [](const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; };
+    bool ok = false;
+    do {
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        long tail = sz < 70000 ? sz : 70000;
+        if (tail < 22) break;
+        std::vector<uint8_t> t(tail);
+        fseek(f, sz - tail, SEEK_SET);
+        if (fread(t.data(), 1, tail, f) != (size_t)tail) break;
+        long e = -1;
+        for (long i = tail - 22; i >= 0; i--)
+            if (t[i] == 0x50 && t[i + 1] == 0x4b && t[i + 2] == 5 && t[i + 3] == 6) { e = i; break; }
+        if (e < 0) break;
+        uint32_t cdSize = u32(&t[e + 12]), cdOff = u32(&t[e + 16]);
+        if (cdOff == 0xFFFFFFFFu || cdSize > (64u << 20)) break;          // zip64 not supported
+        std::vector<uint8_t> cd(cdSize);
+        fseek(f, cdOff, SEEK_SET);
+        if (fread(cd.data(), 1, cdSize, f) != cdSize) break;
+        size_t p = 0;
+        while (p + 46 <= cd.size() && u32(&cd[p]) == 0x02014b50u) {
+            uint32_t method = u16(&cd[p + 10]), csz = u32(&cd[p + 20]), usz = u32(&cd[p + 24]);
+            uint32_t nl = u16(&cd[p + 28]), el = u16(&cd[p + 30]), cl = u16(&cd[p + 32]), lho = u32(&cd[p + 42]);
+            if (p + 46 + nl > cd.size()) break;
+            if (std::string((const char *)&cd[p + 46], nl) == entry) {
+                uint8_t lh[30];
+                fseek(f, lho, SEEK_SET);
+                if (fread(lh, 1, 30, f) != 30 || u32(lh) != 0x04034b50u) break;
+                long dataOff = (long)lho + 30 + u16(lh + 26) + u16(lh + 28);
+                if (csz > (64u << 20) || usz > (64u << 20)) break;
+                std::vector<uint8_t> comp(csz);
+                fseek(f, dataOff, SEEK_SET);
+                if (fread(comp.data(), 1, csz, f) != csz) break;
+                out.assign(usz, 0);
+                if (method == 0) {
+                    ok = (csz == usz);
+                    if (ok) memcpy(out.data(), comp.data(), usz);
+                } else if (method == 8) {
+                    z_stream zs{};
+                    if (inflateInit2(&zs, -MAX_WBITS) == Z_OK) {
+                        zs.next_in = comp.data(); zs.avail_in = csz;
+                        zs.next_out = (Bytef *)out.data(); zs.avail_out = usz;
+                        ok = (inflate(&zs, Z_FINISH) == Z_STREAM_END);
+                        inflateEnd(&zs);
+                    }
+                }
+                break;
+            }
+            p += 46 + nl + el + cl;
+        }
+    } while (0);
+    fclose(f);
+    if (!ok) out.clear();
+    return ok;
+}
+
+static void addUnique(std::vector<std::string> &v, const std::string &s) {
+    for (auto &x : v) if (x == s) return;
+    v.push_back(s);
+}
+
+static std::vector<std::string> apkCandidates() {
+    std::vector<std::string> v;
+    Dl_info info{};
+    if (dladdr((void *)&apkCandidates, &info) && info.dli_fname) {      // where our own .so was loaded from
+        std::string p = info.dli_fname;
+        size_t b = p.find(".apk");
+        if (b != std::string::npos) addUnique(v, p.substr(0, b + 4));
+        size_t l = p.find("/lib/");
+        if (l != std::string::npos) addUnique(v, p.substr(0, l) + "/base.apk");
+    }
+    if (FILE *f = fopen("/proc/self/maps", "r")) {                      // any .apk mapped into the process
+        char line[768];
+        while (fgets(line, sizeof line, f)) {
+            if (!strstr(line, ".apk")) continue;
+            char *path = strchr(line, '/');
+            if (!path) continue;
+            std::string s(path);
+            while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+            size_t b = s.find(".apk");
+            if (b == std::string::npos) continue;
+            s = s.substr(0, b + 4);
+            addUnique(v, s);
+            size_t sl = s.rfind('/');
+            if (sl != std::string::npos) addUnique(v, s.substr(0, sl) + "/base.apk");
+        }
+        fclose(f);
+    }
+    return v;
+}
+
+static bool readFromApk(const char *name, std::vector<char> &out, std::string &tried) {
+    std::string entry = std::string("assets/") + name;
+    for (auto &apk : apkCandidates()) {
+        if (tried.empty()) tried = apk;
+        if (zipRead(apk, entry, out)) { tried = apk; return true; }
+    }
+    return false;
+}
+// APK_END
+
 // ---------------------------------------------------------------- texture loading (main thread only)
 static void *g_tex = nullptr;
 
@@ -247,24 +359,30 @@ static void *MakeTexture(int W, int H) {                 // new Texture2D(W, H) 
     return tex;
 }
 
-static bool LoadTexture() {
-    if (g_tex) return true;
+static void *LoadTextureFile(const char *file) {
 
     std::string pkg = packageName();
     std::vector<std::string> cands = {
-        "/storage/emulated/0/Android/data/" + pkg + "/files/" + IMAGE_FILE,
-        "/sdcard/Android/data/" + pkg + "/files/" + IMAGE_FILE,
-        "/data/data/" + pkg + "/files/" + IMAGE_FILE,
-        "/data/user/0/" + pkg + "/files/" + IMAGE_FILE,
+        "/storage/emulated/0/Android/data/" + pkg + "/files/" + file,
+        "/sdcard/Android/data/" + pkg + "/files/" + file,
+        "/data/data/" + pkg + "/files/" + file,
+        "/data/user/0/" + pkg + "/files/" + file,
     };
     std::vector<char> bytes;
+    bool fromFiles = false;
     for (auto &p : cands)
-        if (readFile(p, bytes)) { STATUS("1 file read OK %zu B", bytes.size()); break; }
-    if (bytes.empty()) { STATUS("FAIL: file not found/empty. pkg='%s' tried: %s", pkg.c_str(), cands[0].c_str()); return false; }
+        if (readFile(p, bytes)) { fromFiles = true; break; }
+    std::string apkTried;
+    if (!fromFiles && !readFromApk(file, bytes, apkTried)) {
+        STATUS("FAIL: '%s' not in files folder (pkg '%s') and not in APK assets/ (apk tried: %s)",
+               file, pkg.c_str(), apkTried.empty() ? "none found" : apkTried.c_str());
+        return nullptr;
+    }
+    STATUS("1 '%s' read OK %zu B from %s", file, bytes.size(), fromFiles ? "files folder" : "APK assets/");
 
     if (!il2cpp_object_new || !il2cpp_array_new || !il2cpp_get_corlib || !il2cpp_class_get_method_from_name) {
         STATUS("FAIL: il2cpp exports missing (object_new/array_new/get_corlib/get_method_from_name)");
-        return false;
+        return nullptr;
     }
 
     void *tex = nullptr;
@@ -291,17 +409,17 @@ static bool LoadTexture() {
     // --- way 2: decode the PNG ourselves, fill the texture with SetPixels32 + Apply
     if (!tex) {
         int W, H; std::vector<uint8_t> rgba; std::string err;
-        if (!decodePNG(bytes, W, H, rgba, err)) { STATUS("FAIL: %s", err.c_str()); return false; }
+        if (!decodePNG(bytes, W, H, rgba, err)) { STATUS("FAIL: %s", err.c_str()); return nullptr; }
         void *coreImg = ImageOf("UnityEngine.CoreModule");
         void *c32K = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Color32") : nullptr;
         void *spMI = nullptr, *apMI = nullptr;
         void *sp = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", "SetPixels32", 1, &spMI);
         void *ap = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", "Apply", 2, &apMI);
-        if (!c32K || !sp || !ap) { STATUS("FAIL: Color32/SetPixels32/Apply not found"); return false; }
+        if (!c32K || !sp || !ap) { STATUS("FAIL: Color32/SetPixels32/Apply not found"); return nullptr; }
         void *t = MakeTexture(W, H);
-        if (!t) return false;
+        if (!t) return nullptr;
         void *arr = il2cpp_array_new(c32K, (uintptr_t)W * H);
-        if (!arr) { STATUS("FAIL: Color32[] alloc"); return false; }
+        if (!arr) { STATUS("FAIL: Color32[] alloc"); return nullptr; }
         uint8_t *dst = (uint8_t *)arr + 0x20;
         for (int y = 0; y < H; y++)                       // Unity rows go bottom-up
             memcpy(dst + (size_t)(H - 1 - y) * W * 4, &rgba[(size_t)y * W * 4], (size_t)W * 4);
@@ -317,8 +435,14 @@ static bool LoadTexture() {
     if (hf) ((void (*)(void *, int, const void *))hf)(tex, 61, hfMI);   // HideFlags.HideAndDontSave
     if (il2cpp_gchandle_new) il2cpp_gchandle_new(tex, false);
 
-    g_tex = tex;
-    return true;
+    return tex;
+}
+
+static bool LoadTexture() {                          // the jumpscare image
+    if (g_tex) return true;
+    g_st = g_status;
+    g_tex = LoadTextureFile(IMAGE_FILE);
+    return g_tex != nullptr;
 }
 
 static int ScreenWidth() {
@@ -329,12 +453,87 @@ static int ScreenWidth() {
 
 static void DrawScare() {
     if (!g_tex) return;
-    static bool said = false;
-    if (!said) { STATUS("3 drawing image (DrawTexture)"); said = true; }
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
     GUI_set_matrix(id, nullptr);                      // no scaling: use real screen pixels
     Rect full{0, 0, (float)ScreenWidth(), (float)Screen_height(nullptr)};
     GUI_DrawTexture(full, g_tex, 0 /*StretchToFill*/, true, 0.0f, Color{1, 1, 1, 1}, 0.0f, 0.0f, nullptr);
+}
+
+// ---------------------------------------------------------------- Granny skin swap
+// Replaces the texture of every Material that uses Granny's texture with our own image.
+// Works by name, at runtime: no .assets editing. The new texture must use the same UV layout as
+// the original (export the original with extract_texture.go, paint on it, save as SKIN_FILE).
+static const char *SKIN_FILE    = "lisovskiy.png";
+static const char *SKIN_TARGET  = "GrannyTexturePainted2";   // prefix of the texture's in-game name
+static const bool  SKIN_ON_SHOW = true;                       // also swap when "Show image" is clicked
+static void *g_skinTex = nullptr;
+static bool  g_skinApplied = false;
+
+static std::string NameOf(void *obj) {                        // UnityEngine.Object.name
+    static void *fn = nullptr, *mi = nullptr;
+    if (!fn) fn = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Object", "get_name", 0, &mi);
+    if (!fn || !obj) return {};
+    return il2cppToStd(((void *(*)(void *, const void *))fn)(obj, mi));
+}
+
+// all loaded objects of a Unity class, as an il2cpp array (length @+0x18, items @+0x20)
+static void *FindAllOfType(const char *asmName, const char *ns, const char *cls) {
+    void *img = ImageOf(asmName);
+    void *k = img ? il2cpp_class_from_name(img, ns, cls) : nullptr;
+    if (!k) return nullptr;
+    void *typeObj = il2cpp_type_get_object(il2cpp_class_get_type(k));
+    void *mi = nullptr;
+    void *fn = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Resources", "FindObjectsOfTypeAll", 1, &mi);
+    if (!fn) fn = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Object", "FindObjectsOfType", 1, &mi);
+    if (!fn || !typeObj) return nullptr;
+    return ((void *(*)(void *, const void *))fn)(typeObj, mi);
+}
+
+static void ApplyGrannySkin() {
+    g_st = g_status2;
+    if (!g_skinTex) {
+        g_skinTex = LoadTextureFile(SKIN_FILE);
+        if (!g_skinTex) return;                                // LoadTextureFile already wrote why
+    }
+
+    void *mats = FindAllOfType("UnityEngine.CoreModule", "UnityEngine", "Material");
+    if (!mats) { STATUS("FAIL: cannot list Materials (Resources.FindObjectsOfTypeAll missing)"); return; }
+
+    void *gmtMI = nullptr, *smtMI = nullptr;
+    void *gmt = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Material", "get_mainTexture", 0, &gmtMI);
+    void *smt = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Material", "set_mainTexture", 1, &smtMI);
+    if (!gmt || !smt) { STATUS("FAIL: Material.get/set_mainTexture not found"); return; }
+
+    uintptr_t n = *(uintptr_t *)((char *)mats + 0x18);
+    void **items = (void **)((char *)mats + 0x20);
+    if (n > 200000) { STATUS("FAIL: bad material array (%lu)", (unsigned long)n); return; }
+
+    int swapped = 0, hints = 0;
+    std::string hint;
+    for (uintptr_t i = 0; i < n; i++) {
+        void *m = items[i];
+        if (!m) continue;
+        void *t = ((void *(*)(void *, const void *))gmt)(m, gmtMI);
+        if (!t) continue;
+        std::string tn = NameOf(t);
+        if (tn.compare(0, strlen(SKIN_TARGET), SKIN_TARGET) == 0) {
+            ((void (*)(void *, void *, const void *))smt)(m, g_skinTex, smtMI);
+            swapped++;
+        } else if (hints < 3 && tn.find("Granny") != std::string::npos && hint.find(tn) == std::string::npos) {
+            hint += tn + " ";
+            hints++;
+        }
+    }
+
+    if (swapped > 0) {
+        g_skinApplied = true;
+        STATUS("skin OK: swapped %d material(s) (of %lu)", swapped, (unsigned long)n);
+    } else if (g_skinApplied) {
+        STATUS("skin already applied (no material uses '%s' any more)", SKIN_TARGET);
+    } else {
+        STATUS("skin: no material uses '%s*' (of %lu). Granny textures seen: %s", SKIN_TARGET, (unsigned long)n,
+               hint.empty() ? "(none - is Granny loaded in this scene?)" : hint.c_str());
+    }
 }
 
 // ---------------------------------------------------------------- game glue
@@ -379,33 +578,38 @@ static void DrawMenu() {
     Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = s; sc.m[15] = 1.0f;
     GUI_set_matrix(sc, nullptr);
 
-    GUI_Box(Rect{40, 40, 300, 420}, Str("Mod Menu"), nullptr);
-    GUI_Label(Rect{55, 70, 270, 30}, Str(g_teddyPlaced ? "Teddy placed: YES" : "Teddy placed: NO"), nullptr);
+    GUI_Box(Rect{40, 20, 300, 500}, Str("Mod Menu"), nullptr);
+    GUI_Label(Rect{55, 50, 270, 30}, Str(g_teddyPlaced ? "Teddy placed: YES" : "Teddy placed: NO"), nullptr);
 
     std::string t = std::string("Last tag: ") + g_lastTag;      // shows what entered the trigger
-    GUI_Label(Rect{55, 90, 270, 30}, Str(t.c_str()), nullptr);
+    GUI_Label(Rect{55, 70, 270, 30}, Str(t.c_str()), nullptr);
 
     std::string sp = "Speed: x" + std::to_string(g_speed);
-    GUI_Label(Rect{55, 125, 270, 30}, Str(sp.c_str()), nullptr);
+    GUI_Label(Rect{55, 100, 270, 30}, Str(sp.c_str()), nullptr);
 
     // speed selector: 1x / 2x / 3x (selected one shown in brackets)
     static const char *names[3]  = {"1x", "2x", "3x"};
     static const char *namesOn[3] = {"[1x]", "[2x]", "[3x]"};
     for (int i = 0; i < 3; i++) {
-        Rect r{55.0f + i * 92.0f, 150, 85, 40};
+        Rect r{55.0f + i * 92.0f, 125, 85, 36};
         if (GUI_Button(r, Str(g_speed == i + 1 ? namesOn[i] : names[i]), nullptr))
             setSpeed(i + 1);
     }
 
-    // show image: full screen for SCARE_MS milliseconds
-    if (GUI_Button(Rect{55, 215, 270, 50}, Str("Show image"), nullptr)) {
+    // show image: full screen for SCARE_MS milliseconds (+ Granny skin swap)
+    if (GUI_Button(Rect{55, 172, 270, 40}, Str("Show image"), nullptr)) {
+        if (SKIN_ON_SHOW) ApplyGrannySkin();              // skin first, so its status is not overwritten
         if (LoadTexture()) g_scareUntil = nowMs() + SCARE_MS;
     }
 
-    if (GUI_Button(Rect{55, 280, 270, 50}, Str("Close"), nullptr))
+    if (GUI_Button(Rect{55, 218, 270, 40}, Str("Granny skin"), nullptr))
+        ApplyGrannySkin();
+
+    if (GUI_Button(Rect{55, 264, 270, 40}, Str("Close"), nullptr))
         g_showMenu = false;                           // reappears next time the teddy is placed
 
-    GUI_Label(Rect{55, 340, 270, 110}, Str(g_status), nullptr);   // debug status (word-wrapped)
+    GUI_Label(Rect{55, 312, 270, 70}, Str(g_status), nullptr);    // image status (word-wrapped)
+    GUI_Label(Rect{55, 388, 270, 120}, Str(g_status2), nullptr);  // skin status
 
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
     GUI_set_matrix(id, nullptr);                      // restore so the game's own GUI isn't scaled
