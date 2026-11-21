@@ -15,7 +15,7 @@
 // Screen.get_width, Object.set_hideFlags) are looked up by NAME through il2cpp, so no new RVAs
 // are needed. Only GUI.DrawTexture (8-arg overload) uses an RVA from your dump.
 //
-// Link: -llog -ldl     Hook lib: Dobby
+// Link: -llog -ldl -lz     Hook lib: Dobby
 
 #include <android/log.h>
 #include <pthread.h>
@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <atomic>
 #include <chrono>
+#include <zlib.h>
+#include <cstdlib>
 #include "dobby.h"
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "TeddyMod", __VA_ARGS__)
@@ -158,6 +160,93 @@ static bool readFile(const std::string &path, std::vector<char> &out) {
 // ---------------------------------------------------------------- texture loading (main thread only)
 static void *g_tex = nullptr;
 
+// ---- minimal PNG decoder (8-bit, non-interlaced; gray/RGB/palette/gray+alpha/RGBA) using zlib
+static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+
+static bool decodePNG(const std::vector<char> &in, int &W, int &H, std::vector<uint8_t> &rgba, std::string &err) {
+    const uint8_t *p = (const uint8_t *)in.data();
+    size_t n = in.size();
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (n < 33 || memcmp(p, sig, 8)) { err = "not a PNG file"; return false; }
+    int bd = 0, ct = 0, il = 0;
+    W = H = 0;
+    std::vector<uint8_t> idat, plte, trns;
+    size_t pos = 8;
+    while (pos + 12 <= n) {
+        uint32_t len = be32(p + pos);
+        const uint8_t *t = p + pos + 4, *d = p + pos + 8;
+        if (pos + 12 + (size_t)len > n) break;
+        if (!memcmp(t, "IHDR", 4) && len >= 13) { W = be32(d); H = be32(d + 4); bd = d[8]; ct = d[9]; il = d[12]; }
+        else if (!memcmp(t, "IDAT", 4)) idat.insert(idat.end(), d, d + len);
+        else if (!memcmp(t, "PLTE", 4)) plte.assign(d, d + len);
+        else if (!memcmp(t, "tRNS", 4)) trns.assign(d, d + len);
+        else if (!memcmp(t, "IEND", 4)) break;
+        pos += 12 + len;
+    }
+    if (W <= 0 || H <= 0 || W > 8192 || H > 8192) { err = "bad PNG size"; return false; }
+    if (bd != 8 || il != 0) { err = "PNG must be 8-bit and not interlaced (re-save as normal RGBA PNG)"; return false; }
+    int ch;
+    switch (ct) { case 0: ch = 1; break; case 2: ch = 3; break; case 3: ch = 1; break; case 4: ch = 2; break; case 6: ch = 4; break;
+                  default: err = "unsupported PNG color type"; return false; }
+    size_t stride = (size_t)W * ch;
+    std::vector<uint8_t> raw((stride + 1) * H);
+    uLongf outLen = raw.size();
+    if (uncompress(raw.data(), &outLen, idat.data(), idat.size()) != Z_OK || outLen != raw.size()) { err = "PNG zlib error"; return false; }
+
+    // un-filter
+    for (int y = 0; y < H; y++) {
+        uint8_t *line = &raw[(size_t)y * (stride + 1) + 1];
+        uint8_t ft = raw[(size_t)y * (stride + 1)];
+        const uint8_t *prev = y ? line - (stride + 1) : nullptr;
+        for (size_t i = 0; i < stride; i++) {
+            int a = i >= (size_t)ch ? line[i - ch] : 0;
+            int b = prev ? prev[i] : 0;
+            int c = (prev && i >= (size_t)ch) ? prev[i - ch] : 0;
+            int v = line[i];
+            switch (ft) {
+                case 1: v += a; break;
+                case 2: v += b; break;
+                case 3: v += (a + b) / 2; break;
+                case 4: { int pp = a + b - c, pa = abs(pp - a), pb = abs(pp - b), pc = abs(pp - c);
+                          v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c); break; }
+                default: break;
+            }
+            line[i] = (uint8_t)v;
+        }
+    }
+
+    // to RGBA (top-down)
+    rgba.assign((size_t)W * H * 4, 255);
+    for (int y = 0; y < H; y++) {
+        const uint8_t *line = &raw[(size_t)y * (stride + 1) + 1];
+        for (int x = 0; x < W; x++) {
+            uint8_t *o = &rgba[((size_t)y * W + x) * 4];
+            const uint8_t *s = line + (size_t)x * ch;
+            switch (ct) {
+                case 0: o[0] = o[1] = o[2] = s[0]; break;
+                case 2: o[0] = s[0]; o[1] = s[1]; o[2] = s[2]; break;
+                case 3: { size_t k = s[0] * 3; if (k + 2 < plte.size()) { o[0] = plte[k]; o[1] = plte[k + 1]; o[2] = plte[k + 2]; }
+                          if (s[0] < trns.size()) o[3] = trns[s[0]]; break; }
+                case 4: o[0] = o[1] = o[2] = s[0]; o[3] = s[1]; break;
+                case 6: o[0] = s[0]; o[1] = s[1]; o[2] = s[2]; o[3] = s[3]; break;
+            }
+        }
+    }
+    return true;
+}
+
+static void *MakeTexture(int W, int H) {                 // new Texture2D(W, H) -> RGBA32
+    void *coreImg = ImageOf("UnityEngine.CoreModule");
+    void *texK = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Texture2D") : nullptr;
+    if (!texK) { STATUS("FAIL: Texture2D class not found"); return nullptr; }
+    void *ctorMI = nullptr;
+    void *ctor = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", ".ctor", 2, &ctorMI);
+    void *tex = il2cpp_object_new(texK);
+    if (!ctor || !tex) { STATUS("FAIL: Texture2D ctor(int,int) not found"); return nullptr; }
+    ((void (*)(void *, int, int, const void *))ctor)(tex, W, H, ctorMI);
+    return tex;
+}
+
 static bool LoadTexture() {
     if (g_tex) return true;
 
@@ -170,7 +259,7 @@ static bool LoadTexture() {
     };
     std::vector<char> bytes;
     for (auto &p : cands)
-        if (readFile(p, bytes)) { STATUS("1 file read OK %zu B: %s", bytes.size(), p.c_str()); break; }
+        if (readFile(p, bytes)) { STATUS("1 file read OK %zu B", bytes.size()); break; }
     if (bytes.empty()) { STATUS("FAIL: file not found/empty. pkg='%s' tried: %s", pkg.c_str(), cands[0].c_str()); return false; }
 
     if (!il2cpp_object_new || !il2cpp_array_new || !il2cpp_get_corlib || !il2cpp_class_get_method_from_name) {
@@ -178,29 +267,49 @@ static bool LoadTexture() {
         return false;
     }
 
-    // byte[] with the file contents (arm64: array data starts at +0x20)
-    void *byteK = il2cpp_class_from_name(il2cpp_get_corlib(), "System", "Byte");
-    if (!byteK) { STATUS("FAIL: System.Byte class not found"); return false; }
-    void *arr = il2cpp_array_new(byteK, bytes.size());
-    if (!arr) { STATUS("FAIL: byte[] alloc"); return false; }
-    memcpy((char *)arr + 0x20, bytes.data(), bytes.size());
+    void *tex = nullptr;
 
-    // new Texture2D(2, 2)
-    void *coreImg = ImageOf("UnityEngine.CoreModule");
-    void *texK    = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Texture2D") : nullptr;
-    if (!texK) { STATUS("FAIL: Texture2D class not found"); return false; }
-    void *ctorMI = nullptr;
-    void *ctor = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", ".ctor", 2, &ctorMI);
-    void *tex = il2cpp_object_new(texK);
-    if (!ctor || !tex) { STATUS("FAIL: Texture2D ctor(int,int) not found"); return false; }
-    ((void (*)(void *, int, int, const void *))ctor)(tex, 2, 2, ctorMI);
-
-    // ImageConversion.LoadImage(tex, bytes)
+    // --- way 1: Unity's own decoder (only if the ImageConversion module is in the game)
     void *liMI = nullptr;
-    void *li = MethodOf("UnityEngine.ImageConversionModule", "UnityEngine", "ImageConversion", "LoadImage", 2, &liMI);
-    if (!li) { STATUS("FAIL: ImageConversion.LoadImage not found (module stripped?)"); return false; }
-    bool ok = ((bool (*)(void *, void *, const void *))li)(tex, arr, liMI);
-    if (!ok) { STATUS("FAIL: LoadImage returned false (bad PNG/JPG?)"); return false; }
+    void *img = ImageOf("UnityEngine.ImageConversionModule");
+    void *li = nullptr;
+    if (img) {
+        void *k = il2cpp_class_from_name(img, "UnityEngine", "ImageConversion");
+        liMI = k ? il2cpp_class_get_method_from_name(k, "LoadImage", 2) : nullptr;
+        li = liMI ? *(void **)liMI : nullptr;
+    }
+    if (li) {
+        void *byteK = il2cpp_class_from_name(il2cpp_get_corlib(), "System", "Byte");
+        void *arr = byteK ? il2cpp_array_new(byteK, bytes.size()) : nullptr;
+        void *t = arr ? MakeTexture(2, 2) : nullptr;
+        if (t) {
+            memcpy((char *)arr + 0x20, bytes.data(), bytes.size());
+            if (((bool (*)(void *, void *, const void *))li)(t, arr, liMI)) tex = t;
+        }
+    }
+
+    // --- way 2: decode the PNG ourselves, fill the texture with SetPixels32 + Apply
+    if (!tex) {
+        int W, H; std::vector<uint8_t> rgba; std::string err;
+        if (!decodePNG(bytes, W, H, rgba, err)) { STATUS("FAIL: %s", err.c_str()); return false; }
+        void *coreImg = ImageOf("UnityEngine.CoreModule");
+        void *c32K = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Color32") : nullptr;
+        void *spMI = nullptr, *apMI = nullptr;
+        void *sp = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", "SetPixels32", 1, &spMI);
+        void *ap = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Texture2D", "Apply", 2, &apMI);
+        if (!c32K || !sp || !ap) { STATUS("FAIL: Color32/SetPixels32/Apply not found"); return false; }
+        void *t = MakeTexture(W, H);
+        if (!t) return false;
+        void *arr = il2cpp_array_new(c32K, (uintptr_t)W * H);
+        if (!arr) { STATUS("FAIL: Color32[] alloc"); return false; }
+        uint8_t *dst = (uint8_t *)arr + 0x20;
+        for (int y = 0; y < H; y++)                       // Unity rows go bottom-up
+            memcpy(dst + (size_t)(H - 1 - y) * W * 4, &rgba[(size_t)y * W * 4], (size_t)W * 4);
+        ((void (*)(void *, void *, const void *))sp)(t, arr, spMI);
+        ((void (*)(void *, bool, bool, const void *))ap)(t, true, false, apMI);
+        tex = t;
+        STATUS("2 texture OK via PNG decode %dx%d", W, H);
+    }
 
     // keep it alive: HideAndDontSave + GC handle
     void *hfMI = nullptr;
@@ -209,7 +318,6 @@ static bool LoadTexture() {
     if (il2cpp_gchandle_new) il2cpp_gchandle_new(tex, false);
 
     g_tex = tex;
-    STATUS("2 texture OK (%zu B file)", bytes.size());
     return true;
 }
 
