@@ -1,21 +1,22 @@
-// teddy_unitygui.cpp - arm64 il2cpp (Slendrina): Dobby + Unity's built-in IMGUI
+// teddy_unitygui.cpp - arm64 il2cpp (Granny): Dobby + Unity's built-in IMGUI
 // Menu appears when the teddy is placed.
-//   * Speed selector 1x / 2x / 3x (Time.timeScale), FPS counter hidden
-//   * "Show image" button -> full-screen image (jumpscare) for 1.5 seconds, loaded from a file
+//   * "Show image" button ARMS a trap (and preloads yedu.png + naxui.wav).
+//   * When Granny catches the player (EnemyAIGranny.Playercaught) -> Time.timeScale = 0
+//     and a GUI question appears: "Хочеш штоб тебя сьел дрон?"
+//       - Да  -> full-screen yedu.png + naxui.wav; after 3 s the text "Ти теперь щастлив" appears,
+//                image + text stay forever (timeScale stays 0)
+//       - Нет -> timeScale = 1, game continues
+//   * Granny skin swap button kept as before. Speed selector removed. FPS counter hidden.
 //
-// Images are read from the APK's assets/ folder (assets/jumpscare.png, assets/lisovskiy.png)
-// or, if present, from the game's files folder (checked first, handy for testing):
-// Image file (PNG/JPG), put it in the game's own files folder (no permission needed):
-//   /sdcard/Android/data/<package>/files/jumpscare.png
-// (also tried: /data/data/<package>/files/jumpscare.png)
+// Files (png / wav) are looked up in the game's files folder first:
+//   /sdcard/Android/data/<package>/files/yedu.png , naxui.wav
+// and then in the APK's assets/ folder (assets/yedu.png, assets/naxui.wav).
+//
+// WAV: PCM 8/16-bit or 32-bit float, any channels / sample rate.
+// PNG: 8-bit, non-interlaced (or anything Unity's ImageConversion can load).
 //
 // Unity GUI calls only work inside an OnGUI() callback. We borrow the game's own FPSDisplay.OnGUI:
 // when the teddy is placed we AddComponent(FPSDisplay) onto the teddy object and hook its OnGUI.
-//
-// Everything that touches Unity objects (texture creation, drawing) runs inside that OnGUI hook,
-// i.e. on Unity's main thread. Extra methods (Texture2D ctor, ImageConversion.LoadImage,
-// Screen.get_width, Object.set_hideFlags) are looked up by NAME through il2cpp, so no new RVAs
-// are needed. Only GUI.DrawTexture (8-arg overload) uses an RVA from your dump.
 //
 // Link: -llog -ldl -lz     Hook lib: Dobby
 
@@ -36,14 +37,16 @@
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "TeddyMod", __VA_ARGS__)
 
-// on-screen status line (shown in the menu) - so you can debug without logcat
+// on-screen status lines (shown in the menu) - so you can debug without logcat
 static char g_status[300]  = "image: idle";
 static char g_status2[300] = "skin: idle";
+static char g_status3[300] = "sound: idle";
 static char *g_st = g_status;                        // which line STATUS() currently writes to
 #define STATUS(...) do { snprintf(g_st, 300, __VA_ARGS__); LOG("%s", g_st); } while (0)
 
 constexpr uintptr_t RVA_OnTriggerEnter = 0x15531F8;
 constexpr uintptr_t RVA_FPS_OnGUI      = 0x144D828;
+constexpr uintptr_t RVA_Playercaught   = 0x145BACC;   // EnemyAIGranny.Playercaught() : IEnumerator
 constexpr uintptr_t RVA_get_tag        = 0x2A9ACD0;
 constexpr uintptr_t RVA_get_gameObject = 0x2A9A678;
 constexpr uintptr_t RVA_AddComponent   = 0x2A9DEB0;
@@ -57,15 +60,18 @@ constexpr uintptr_t RVA_set_timeScale  = 0x2AA61C0;
 constexpr uintptr_t RVA_GUI_DrawTexture = 0x2AC98E4;
 
 static const char *TEDDY_TAG   = "teddy";
-static const char *IMAGE_FILE  = "jumpscare.png";
-static const int   SCARE_MS    = 1500;               // how long the image stays on screen
+static const char *IMAGE_FILE  = "yedu.png";
+static const char *SOUND_FILE  = "naxui.wav";
+static const int   TEXT_DELAY_MS = 3000;              // after "Да": when the final text appears
 static char g_lastTag[64] = "(none yet)";
 
 static std::atomic<bool> g_teddyPlaced{false};
 static std::atomic<bool> g_showMenu{false};
-static std::atomic<long long> g_scareUntil{0};       // steady-clock ms; image shown while now < this
+static std::atomic<bool> g_armed{false};              // "Show image" clicked: waiting for Playercaught
+static std::atomic<bool> g_prompt{false};             // question dialog is on screen
+static std::atomic<bool> g_yes{false};                // player answered "Да"
+static long long g_yesAt = 0;                         // steady-clock ms when "Да" was clicked
 static bool g_hostAdded = false;
-static int  g_speed = 1;                              // 1, 2 or 3
 
 // ---------------------------------------------------------------- types
 struct Rect { float x, y, w, h; };
@@ -118,18 +124,18 @@ static std::string il2cppToStd(void *str) {          // length @0x10, UTF-16 @0x
     return out;
 }
 
-static void *Str(const char *s) { return il2cpp_string_new(s); }
+static void *Str(const char *s) { return il2cpp_string_new(s); }   // UTF-8 in, so Cyrillic is fine
 
 static long long nowMs() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-// look up an il2cpp method by name; returns the native function pointer (MethodInfo's first field)
 static void *ImageOf(const char *asmName) {
     void *a = il2cpp_domain_assembly_open(il2cpp_domain_get(), asmName);
     return a ? il2cpp_assembly_get_image(a) : nullptr;
 }
+// look up an il2cpp method by name; returns the native function pointer (MethodInfo's first field)
 static void *MethodOf(const char *asmName, const char *ns, const char *cls, const char *name, int argc, void **miOut = nullptr) {
     void *img = ImageOf(asmName);
     void *k   = img ? il2cpp_class_from_name(img, ns, cls) : nullptr;
@@ -163,7 +169,6 @@ static bool readFile(const std::string &path, std::vector<char> &out) {
 
 // ---------------------------------------------------------------- read assets/<name> from the installed APK
 // (an APK is a zip: find the entry in the central directory and unpack it with zlib)
-// APK_BEGIN
 static bool zipRead(const std::string &apk, const std::string &entry, std::vector<char> &out) {
     FILE *f = fopen(apk.c_str(), "rb");
     if (!f) return false;
@@ -267,12 +272,29 @@ static bool readFromApk(const char *name, std::vector<char> &out, std::string &t
     }
     return false;
 }
-// APK_END
 
-// ---------------------------------------------------------------- texture loading (main thread only)
-static void *g_tex = nullptr;
+// files folder first, then APK assets/. Writes a STATUS line on failure (to the current g_st line).
+static bool LoadBytes(const char *file, std::vector<char> &bytes, bool &fromFiles) {
+    std::string pkg = packageName();
+    std::vector<std::string> cands = {
+        "/storage/emulated/0/Android/data/" + pkg + "/files/" + file,
+        "/sdcard/Android/data/" + pkg + "/files/" + file,
+        "/data/data/" + pkg + "/files/" + file,
+        "/data/user/0/" + pkg + "/files/" + file,
+    };
+    fromFiles = false;
+    for (auto &p : cands)
+        if (readFile(p, bytes)) { fromFiles = true; return true; }
+    std::string apkTried;
+    if (!readFromApk(file, bytes, apkTried)) {
+        STATUS("FAIL: '%s' not in files folder (pkg '%s') and not in APK assets/ (apk tried: %s)",
+               file, pkg.c_str(), apkTried.empty() ? "none found" : apkTried.c_str());
+        return false;
+    }
+    return true;
+}
 
-// ---- minimal PNG decoder (8-bit, non-interlaced; gray/RGB/palette/gray+alpha/RGBA) using zlib
+// ---------------------------------------------------------------- minimal PNG decoder
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
 static bool decodePNG(const std::vector<char> &in, int &W, int &H, std::vector<uint8_t> &rgba, std::string &err) {
@@ -305,8 +327,7 @@ static bool decodePNG(const std::vector<char> &in, int &W, int &H, std::vector<u
     uLongf outLen = raw.size();
     if (uncompress(raw.data(), &outLen, idat.data(), idat.size()) != Z_OK || outLen != raw.size()) { err = "PNG zlib error"; return false; }
 
-    // un-filter
-    for (int y = 0; y < H; y++) {
+    for (int y = 0; y < H; y++) {                      // un-filter
         uint8_t *line = &raw[(size_t)y * (stride + 1) + 1];
         uint8_t ft = raw[(size_t)y * (stride + 1)];
         const uint8_t *prev = y ? line - (stride + 1) : nullptr;
@@ -327,8 +348,7 @@ static bool decodePNG(const std::vector<char> &in, int &W, int &H, std::vector<u
         }
     }
 
-    // to RGBA (top-down)
-    rgba.assign((size_t)W * H * 4, 255);
+    rgba.assign((size_t)W * H * 4, 255);               // to RGBA (top-down)
     for (int y = 0; y < H; y++) {
         const uint8_t *line = &raw[(size_t)y * (stride + 1) + 1];
         for (int x = 0; x < W; x++) {
@@ -347,6 +367,50 @@ static bool decodePNG(const std::vector<char> &in, int &W, int &H, std::vector<u
     return true;
 }
 
+// ---------------------------------------------------------------- minimal WAV decoder -> interleaved floats
+static bool decodeWAV(const std::vector<char> &in, int &channels, int &hz, std::vector<float> &out, std::string &err) {
+    const uint8_t *p = (const uint8_t *)in.data();
+    size_t n = in.size();
+    auto le16 = [](const uint8_t *q) { return (int)(q[0] | q[1] << 8); };
+    auto le32 = [](const uint8_t *q) { return (uint32_t)q[0] | (uint32_t)q[1] << 8 | (uint32_t)q[2] << 16 | (uint32_t)q[3] << 24; };
+    if (n < 44 || memcmp(p, "RIFF", 4) || memcmp(p + 8, "WAVE", 4)) { err = "not a WAV file"; return false; }
+    int fmtTag = 0, bits = 0;
+    channels = 0; hz = 0;
+    const uint8_t *data = nullptr;
+    size_t dataLen = 0;
+    size_t pos = 12;
+    while (pos + 8 <= n) {
+        uint32_t len = le32(p + pos + 4);
+        const uint8_t *d = p + pos + 8;
+        if (!memcmp(p + pos, "fmt ", 4) && len >= 16 && pos + 8 + 16 <= n) {
+            fmtTag = le16(d); channels = le16(d + 2); hz = (int)le32(d + 4); bits = le16(d + 14);
+            if (fmtTag == 0xFFFE && len >= 26 && pos + 8 + 26 <= n) fmtTag = le16(d + 24);   // extensible: real tag
+        } else if (!memcmp(p + pos, "data", 4)) {
+            data = d;
+            dataLen = pos + 8 + len <= n ? len : n - pos - 8;
+            break;
+        }
+        pos += 8 + (size_t)len + (len & 1);
+    }
+    if (!data || channels < 1 || channels > 8 || hz < 8000 || hz > 192000) { err = "bad WAV header"; return false; }
+    if (fmtTag == 1 && bits == 16) {
+        size_t cnt = dataLen / 2;
+        out.resize(cnt);
+        for (size_t i = 0; i < cnt; i++) out[i] = (int16_t)(data[i * 2] | data[i * 2 + 1] << 8) / 32768.0f;
+    } else if (fmtTag == 1 && bits == 8) {
+        out.resize(dataLen);
+        for (size_t i = 0; i < dataLen; i++) out[i] = ((int)data[i] - 128) / 128.0f;
+    } else if (fmtTag == 3 && bits == 32) {
+        size_t cnt = dataLen / 4;
+        out.resize(cnt);
+        for (size_t i = 0; i < cnt; i++) memcpy(&out[i], data + i * 4, 4);
+    } else { err = "WAV must be PCM 8/16-bit or float32"; return false; }
+    out.resize(out.size() / channels * channels);
+    if (out.empty()) { err = "WAV has no samples"; return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------- textures (main thread only)
 static void *MakeTexture(int W, int H) {                 // new Texture2D(W, H) -> RGBA32
     void *coreImg = ImageOf("UnityEngine.CoreModule");
     void *texK = coreImg ? il2cpp_class_from_name(coreImg, "UnityEngine", "Texture2D") : nullptr;
@@ -359,25 +423,17 @@ static void *MakeTexture(int W, int H) {                 // new Texture2D(W, H) 
     return tex;
 }
 
-static void *LoadTextureFile(const char *file) {
+static void KeepAlive(void *obj) {                       // HideAndDontSave + GC handle
+    void *hfMI = nullptr;
+    void *hf = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Object", "set_hideFlags", 1, &hfMI);
+    if (hf) ((void (*)(void *, int, const void *))hf)(obj, 61, hfMI);   // HideFlags.HideAndDontSave
+    if (il2cpp_gchandle_new) il2cpp_gchandle_new(obj, false);
+}
 
-    std::string pkg = packageName();
-    std::vector<std::string> cands = {
-        "/storage/emulated/0/Android/data/" + pkg + "/files/" + file,
-        "/sdcard/Android/data/" + pkg + "/files/" + file,
-        "/data/data/" + pkg + "/files/" + file,
-        "/data/user/0/" + pkg + "/files/" + file,
-    };
+static void *LoadTextureFile(const char *file) {
     std::vector<char> bytes;
     bool fromFiles = false;
-    for (auto &p : cands)
-        if (readFile(p, bytes)) { fromFiles = true; break; }
-    std::string apkTried;
-    if (!fromFiles && !readFromApk(file, bytes, apkTried)) {
-        STATUS("FAIL: '%s' not in files folder (pkg '%s') and not in APK assets/ (apk tried: %s)",
-               file, pkg.c_str(), apkTried.empty() ? "none found" : apkTried.c_str());
-        return nullptr;
-    }
+    if (!LoadBytes(file, bytes, fromFiles)) return nullptr;
     STATUS("1 '%s' read OK %zu B from %s", file, bytes.size(), fromFiles ? "files folder" : "APK assets/");
 
     if (!il2cpp_object_new || !il2cpp_array_new || !il2cpp_get_corlib || !il2cpp_class_get_method_from_name) {
@@ -429,20 +485,8 @@ static void *LoadTextureFile(const char *file) {
         STATUS("2 texture OK via PNG decode %dx%d", W, H);
     }
 
-    // keep it alive: HideAndDontSave + GC handle
-    void *hfMI = nullptr;
-    void *hf = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Object", "set_hideFlags", 1, &hfMI);
-    if (hf) ((void (*)(void *, int, const void *))hf)(tex, 61, hfMI);   // HideFlags.HideAndDontSave
-    if (il2cpp_gchandle_new) il2cpp_gchandle_new(tex, false);
-
+    KeepAlive(tex);
     return tex;
-}
-
-static bool LoadTexture() {                          // the jumpscare image
-    if (g_tex) return true;
-    g_st = g_status;
-    g_tex = LoadTextureFile(IMAGE_FILE);
-    return g_tex != nullptr;
 }
 
 static int ScreenWidth() {
@@ -451,18 +495,75 @@ static int ScreenWidth() {
     return fn ? ((int (*)(const void *))fn)(mi) : (int)(Screen_height(nullptr) * 16 / 9);
 }
 
-static void DrawScare() {
-    if (!g_tex) return;
-    Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
-    GUI_set_matrix(id, nullptr);                      // no scaling: use real screen pixels
-    Rect full{0, 0, (float)ScreenWidth(), (float)Screen_height(nullptr)};
-    GUI_DrawTexture(full, g_tex, 0 /*StretchToFill*/, true, 0.0f, Color{1, 1, 1, 1}, 0.0f, 0.0f, nullptr);
+// ---------------------------------------------------------------- sound: WAV -> AudioClip -> AudioSource
+static void *g_clip = nullptr;
+static bool  g_soundPlayed = false;
+
+static void *LoadClipFile(const char *file) {
+    std::vector<char> bytes;
+    bool fromFiles = false;
+    if (!LoadBytes(file, bytes, fromFiles)) return nullptr;
+
+    int ch, hz; std::vector<float> pcm; std::string err;
+    if (!decodeWAV(bytes, ch, hz, pcm, err)) { STATUS("FAIL: %s", err.c_str()); return nullptr; }
+    int frames = (int)(pcm.size() / ch);
+
+    void *createMI = nullptr, *setMI = nullptr;
+    void *create = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioClip", "Create", 5, &createMI);
+    void *setData = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioClip", "SetData", 2, &setMI);
+    if (!create || !setData || !il2cpp_array_new || !il2cpp_get_corlib) { STATUS("FAIL: AudioClip.Create/SetData not found"); return nullptr; }
+
+    void *clip = ((void *(*)(void *, int, int, int, bool, const void *))create)(Str("naxui"), frames, ch, hz, false, createMI);
+    if (!clip) { STATUS("FAIL: AudioClip.Create returned null"); return nullptr; }
+    void *floatK = il2cpp_class_from_name(il2cpp_get_corlib(), "System", "Single");
+    void *arr = floatK ? il2cpp_array_new(floatK, pcm.size()) : nullptr;
+    if (!arr) { STATUS("FAIL: float[] alloc"); return nullptr; }
+    memcpy((char *)arr + 0x20, pcm.data(), pcm.size() * sizeof(float));
+    ((bool (*)(void *, void *, int, const void *))setData)(clip, arr, 0, setMI);
+    KeepAlive(clip);
+    STATUS("sound OK: %d ch, %d Hz, %.1f s (%s)", ch, hz, (double)frames / hz, fromFiles ? "files folder" : "APK assets/");
+    return clip;
 }
 
-// ---------------------------------------------------------------- Granny skin swap
+static void PlayClip(void *clip) {
+    if (!clip) return;
+    void *goK = nullptr;
+    if (void *core = ImageOf("UnityEngine.CoreModule")) goK = il2cpp_class_from_name(core, "UnityEngine", "GameObject");
+    void *ctorMI = nullptr;
+    void *ctor = MethodOf("UnityEngine.CoreModule", "UnityEngine", "GameObject", ".ctor", 0, &ctorMI);
+    void *audImg = ImageOf("UnityEngine.AudioModule");
+    void *asK = audImg ? il2cpp_class_from_name(audImg, "UnityEngine", "AudioSource") : nullptr;
+    if (!goK || !ctor || !asK) { STATUS("FAIL: GameObject/AudioSource not found"); return; }
+
+    void *go = il2cpp_object_new(goK);
+    ((void (*)(void *, const void *))ctor)(go, ctorMI);
+    if (il2cpp_gchandle_new) il2cpp_gchandle_new(go, false);
+    void *dMI = nullptr;
+    void *dont = MethodOf("UnityEngine.CoreModule", "UnityEngine", "Object", "DontDestroyOnLoad", 1, &dMI);
+    if (dont) ((void (*)(void *, const void *))dont)(go, dMI);
+
+    void *src = AddComponent(go, il2cpp_type_get_object(il2cpp_class_get_type(asK)), nullptr);
+    if (!src) { STATUS("FAIL: AddComponent(AudioSource)"); return; }
+
+    void *m1 = nullptr, *m2 = nullptr, *m3 = nullptr, *m4 = nullptr, *m5 = nullptr, *m6 = nullptr;
+    void *setClip = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "set_clip", 1, &m1);
+    void *setVol  = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "set_volume", 1, &m2);
+    void *setBlend= MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "set_spatialBlend", 1, &m3);
+    void *setIgn  = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "set_ignoreListenerPause", 1, &m4);
+    void *setLoop = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "set_loop", 1, &m5);
+    void *play    = MethodOf("UnityEngine.AudioModule", "UnityEngine", "AudioSource", "Play", 0, &m6);
+    if (!setClip || !play) { STATUS("FAIL: AudioSource.set_clip/Play not found"); return; }
+    ((void (*)(void *, void *, const void *))setClip)(src, clip, m1);
+    if (setVol)   ((void (*)(void *, float, const void *))setVol)(src, 1.0f, m2);
+    if (setBlend) ((void (*)(void *, float, const void *))setBlend)(src, 0.0f, m3);   // 2D sound
+    if (setIgn)   ((void (*)(void *, bool, const void *))setIgn)(src, true, m4);
+    if (setLoop)  ((void (*)(void *, bool, const void *))setLoop)(src, false, m5);
+    ((void (*)(void *, const void *))play)(src, m6);
+    LOG("sound playing");
+}
+
+// ---------------------------------------------------------------- Granny skin swap (unchanged)
 // Replaces the texture of every Material that uses Granny's texture with our own image.
-// Works by name, at runtime: no .assets editing. The new texture must use the same UV layout as
-// the original (export the original with extract_texture.go, paint on it, save as SKIN_FILE).
 static const char *SKIN_FILE    = "lisovskiy.png";
 static const char *SKIN_TARGET  = "GrannyTexturePainted2";   // prefix of the texture's in-game name
 static const bool  SKIN_ON_SHOW = true;                       // also swap when "Show image" is clicked
@@ -537,6 +638,8 @@ static void ApplyGrannySkin() {
 }
 
 // ---------------------------------------------------------------- game glue
+static void *g_yeduTex = nullptr;
+
 // Add FPSDisplay to the teddy's GameObject so its OnGUI (which we hook) is guaranteed to run.
 static void ensureHost(void *teddyBehaviour) {
     if (g_hostAdded) return;
@@ -548,12 +651,6 @@ static void ensureHost(void *teddyBehaviour) {
     void *typeObj = il2cpp_type_get_object(il2cpp_class_get_type(klass));
     void *go = get_gameObject(teddyBehaviour, nullptr);
     if (go && typeObj) { AddComponent(go, typeObj, nullptr); g_hostAdded = true; LOG("host component added"); }
-}
-
-static void setSpeed(int s) {
-    g_speed = s;
-    set_timeScale((float)s);
-    LOG("timeScale -> %d", s);
 }
 
 // ---------------------------------------------------------------- hooks
@@ -573,6 +670,18 @@ static void hook_OnTriggerEnter(void *self, void *other, const void *mi) {
     orig_OnTriggerEnter(self, other, mi);
 }
 
+// EnemyAIGranny.Playercaught() - runs when Granny catches the player
+static void *(*orig_Playercaught)(void *, const void *) = nullptr;
+static void *hook_Playercaught(void *self, const void *mi) {
+    if (g_armed && !g_prompt && !g_yes) {
+        g_armed  = false;
+        g_prompt = true;
+        set_timeScale(0.0f);                          // freeze the game, GUI keeps working
+        LOG("Player caught -> timeScale 0, prompt shown");
+    }
+    return orig_Playercaught(self, mi);
+}
+
 static void DrawMenu() {
     float s = Screen_height(nullptr) / 540.0f;        // scale so text/buttons are phone-sized
     Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = s; sc.m[15] = 1.0f;
@@ -584,41 +693,94 @@ static void DrawMenu() {
     std::string t = std::string("Last tag: ") + g_lastTag;      // shows what entered the trigger
     GUI_Label(Rect{55, 70, 270, 30}, Str(t.c_str()), nullptr);
 
-    std::string sp = "Speed: x" + std::to_string(g_speed);
-    GUI_Label(Rect{55, 100, 270, 30}, Str(sp.c_str()), nullptr);
+    GUI_Label(Rect{55, 95, 270, 30}, Str(g_armed ? "Trap: ARMED (waiting for Granny)" : "Trap: not armed"), nullptr);
 
-    // speed selector: 1x / 2x / 3x (selected one shown in brackets)
-    static const char *names[3]  = {"1x", "2x", "3x"};
-    static const char *namesOn[3] = {"[1x]", "[2x]", "[3x]"};
-    for (int i = 0; i < 3; i++) {
-        Rect r{55.0f + i * 92.0f, 125, 85, 36};
-        if (GUI_Button(r, Str(g_speed == i + 1 ? namesOn[i] : names[i]), nullptr))
-            setSpeed(i + 1);
-    }
-
-    // show image: full screen for SCARE_MS milliseconds (+ Granny skin swap)
-    if (GUI_Button(Rect{55, 172, 270, 40}, Str("Show image"), nullptr)) {
+    // arm the trap: preload image + sound, so any problem shows up right now
+    if (GUI_Button(Rect{55, 125, 270, 40}, Str("Show image"), nullptr)) {
         if (SKIN_ON_SHOW) ApplyGrannySkin();              // skin first, so its status is not overwritten
-        if (LoadTexture()) g_scareUntil = nowMs() + SCARE_MS;
+        g_st = g_status;
+        if (!g_yeduTex) g_yeduTex = LoadTextureFile(IMAGE_FILE);
+        g_st = g_status3;
+        if (!g_clip) g_clip = LoadClipFile(SOUND_FILE);
+        g_armed = true;
+        LOG("trap armed");
     }
 
-    if (GUI_Button(Rect{55, 218, 270, 40}, Str("Granny skin"), nullptr))
+    if (GUI_Button(Rect{55, 171, 270, 40}, Str("Granny skin"), nullptr))
         ApplyGrannySkin();
 
-    if (GUI_Button(Rect{55, 264, 270, 40}, Str("Close"), nullptr))
+    if (GUI_Button(Rect{55, 217, 270, 40}, Str("Close"), nullptr))
         g_showMenu = false;                           // reappears next time the teddy is placed
 
-    GUI_Label(Rect{55, 312, 270, 70}, Str(g_status), nullptr);    // image status (word-wrapped)
-    GUI_Label(Rect{55, 388, 270, 120}, Str(g_status2), nullptr);  // skin status
+    GUI_Label(Rect{55, 265, 270, 70}, Str(g_status), nullptr);     // image status (word-wrapped)
+    GUI_Label(Rect{55, 340, 270, 70}, Str(g_status2), nullptr);    // skin status
+    GUI_Label(Rect{55, 415, 270, 90}, Str(g_status3), nullptr);    // sound status
 
     Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
     GUI_set_matrix(id, nullptr);                      // restore so the game's own GUI isn't scaled
 }
 
+static void DrawPrompt() {
+    float s = Screen_height(nullptr) / 540.0f;
+    float vw = ScreenWidth() / s;                     // virtual width after scaling
+    Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = s; sc.m[15] = 1.0f;
+    GUI_set_matrix(sc, nullptr);
+
+    float bw = 360, bh = 180;
+    float bx = (vw - bw) / 2, by = (540 - bh) / 2;
+    GUI_Box(Rect{bx, by, bw, bh}, Str(""), nullptr);
+    GUI_Label(Rect{bx + 20, by + 25, bw - 40, 50}, Str("Хочеш штоб тебя сьел дрон?"), nullptr);
+
+    if (GUI_Button(Rect{bx + 30, by + 100, 130, 50}, Str("Да"), nullptr)) {
+        g_yes    = true;
+        g_prompt = false;
+        g_yesAt  = nowMs();
+        g_soundPlayed = false;
+        LOG("answer: yes");
+    }
+    if (GUI_Button(Rect{bx + bw - 160, by + 100, 130, 50}, Str("Нет"), nullptr)) {
+        g_prompt = false;
+        set_timeScale(1.0f);                          // just go on playing
+        LOG("answer: no -> timeScale 1");
+    }
+
+    Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
+    GUI_set_matrix(id, nullptr);
+}
+
+static void DrawFinal() {
+    if (!g_soundPlayed) {                             // start the sound once
+        g_soundPlayed = true;
+        g_st = g_status3;
+        if (!g_clip) g_clip = LoadClipFile(SOUND_FILE);
+        PlayClip(g_clip);
+    }
+    if (!g_yeduTex) { g_st = g_status; g_yeduTex = LoadTextureFile(IMAGE_FILE); }
+
+    Matrix4x4 id{}; id.m[0] = id.m[5] = id.m[10] = id.m[15] = 1.0f;
+    GUI_set_matrix(id, nullptr);                      // real screen pixels
+    Rect full{0, 0, (float)ScreenWidth(), (float)Screen_height(nullptr)};
+    if (g_yeduTex)
+        GUI_DrawTexture(full, g_yeduTex, 0 /*StretchToFill*/, true, 0.0f, Color{1, 1, 1, 1}, 0.0f, 0.0f, nullptr);
+
+    if (nowMs() - g_yesAt >= TEXT_DELAY_MS) {         // 3 s later: the text, forever
+        float k = Screen_height(nullptr) / 540.0f * 3.0f;
+        Matrix4x4 sc{}; sc.m[0] = sc.m[5] = sc.m[10] = k; sc.m[15] = 1.0f;
+        GUI_set_matrix(sc, nullptr);
+        float vw = ScreenWidth() / k;
+        float bw = 150, bh = 34;
+        float bx = (vw - bw) / 2, by = (180 - bh) / 2;
+        GUI_Box(Rect{bx, by, bw, bh}, Str(""), nullptr);                  // dark backing for readability
+        GUI_Label(Rect{bx + 14, by + 7, bw - 20, 24}, Str("Ти теперь щастлив"), nullptr);
+        GUI_set_matrix(id, nullptr);
+    }
+}
+
 static void (*orig_FPS_OnGUI)(void *, const void *) = nullptr;
 static void hook_FPS_OnGUI(void *self, const void *mi) {
-    if (nowMs() < g_scareUntil) { DrawScare(); return; }   // image only, menu hidden meanwhile
-    if (g_showMenu) DrawMenu();                       // we are inside an OnGUI call here
+    if (g_yes)         { DrawFinal();  return; }      // final screen stays forever
+    if (g_prompt)      { DrawPrompt(); return; }      // question while the game is frozen
+    if (g_showMenu)      DrawMenu();                  // we are inside an OnGUI call here
     // orig_FPS_OnGUI intentionally NOT called -> FPS counter is hidden
 }
 
@@ -640,7 +802,7 @@ static void *init_thread(void *) {
     if (!il2cpp_string_new || !il2cpp_class_from_name)
         LOG("il2cpp exports missing (stripped?) - need another way to make strings/find FPSDisplay");
     if (!il2cpp_object_new || !il2cpp_array_new || !il2cpp_get_corlib || !il2cpp_class_get_method_from_name)
-        LOG("exports for image loading missing - 'Show image' will not work");
+        LOG("exports for image/sound loading missing - they will not work");
 
     get_tag         = (decltype(get_tag))(base + RVA_get_tag);
     get_gameObject  = (decltype(get_gameObject))(base + RVA_get_gameObject);
@@ -655,6 +817,7 @@ static void *init_thread(void *) {
 
     DobbyHook((void *)(base + RVA_OnTriggerEnter), (void *)hook_OnTriggerEnter, (void **)&orig_OnTriggerEnter);
     DobbyHook((void *)(base + RVA_FPS_OnGUI),      (void *)hook_FPS_OnGUI,      (void **)&orig_FPS_OnGUI);
+    DobbyHook((void *)(base + RVA_Playercaught),   (void *)hook_Playercaught,   (void **)&orig_Playercaught);
     LOG("hooks installed");
     return nullptr;
 }
