@@ -7,6 +7,7 @@
 //                image + text stay forever (timeScale stays 0)
 //       - Нет -> timeScale = 1, game continues
 //   * Granny skin swap button kept as before. Speed selector removed. FPS counter hidden.
+//   * NEW: "Golda" difficulty added to the difficulty Dropdown (Granny = 2x Hard speed).
 //
 // Files (png / wav) are looked up in the game's files folder first:
 //   /sdcard/Android/data/<package>/files/yedu.png , naxui.wav
@@ -26,6 +27,8 @@
 #include <dlfcn.h>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -784,6 +787,176 @@ static void hook_FPS_OnGUI(void *self, const void *mi) {
     // orig_FPS_OnGUI intentionally NOT called -> FPS counter is hidden
 }
 
+// ============================================================================
+// GOLDA MODE
+//   * Finds the difficulty Dropdown (the one that has a "Hard" option) and adds a
+//     "Golda" option. Done in Dropdown.Start and again in Dropdown.Show, so it
+//     appears even if the game rebuilds the list.
+//   * Choosing "Golda" tells the game "Hard" (so Hard's normal logic runs), but
+//     keeps "Golda" shown in the dropdown and sets g_golda = true.
+//   * While g_golda is on, every EnemyAIGranny.FixedUpdate multiplies Granny's
+//     speed fields by GOLDA_MULT (2x Hard). It re-bases if the game overwrites a
+//     value, so the multiplier never compounds.
+// ============================================================================
+constexpr uintptr_t RVA_DD_Start       = 0x2B659C4;   // Dropdown.Start
+constexpr uintptr_t RVA_DD_Show        = 0x2B66784;   // Dropdown.Show
+constexpr uintptr_t RVA_DD_set_value   = 0x2B6558C;   // Dropdown.set_value(int)
+constexpr uintptr_t RVA_DD_get_options = 0x2B647E4;   // Dropdown.get_options() -> List<OptionData>
+constexpr uintptr_t RVA_DD_SetNoNotify = 0x2B656C8;   // Dropdown.SetValueWithoutNotify(int)
+constexpr uintptr_t RVA_DD_Refresh     = 0x2B64804;   // Dropdown.RefreshShownValue()
+constexpr uintptr_t RVA_OD_get_text    = 0x2B68458;   // OptionData.get_text()
+constexpr uintptr_t RVA_OD_ctor_str    = 0x2B65E70;   // OptionData..ctor(string)
+constexpr uintptr_t RVA_Granny_FixedUpdate = 0x14549E4; // EnemyAIGranny.FixedUpdate()
+
+static const char *GOLDA_NAME = "Golda";
+static const float GOLDA_MULT = 2.0f;                  // 2x Hard mode speed
+static std::atomic<bool> g_golda{false};
+static const bool GOLDA_DEFAULT = true;                // true = Golda is selected automatically when the game opens
+static bool g_goldaAutoDone = false;
+static void hook_DD_set_value(void *self, int v, const void *mi);   // defined below
+
+static void *(*dd_get_options)(void *, const void *)       = nullptr;
+static void  (*dd_set_nonotify)(void *, int, const void *) = nullptr;
+static void  (*dd_refresh)(void *, const void *)           = nullptr;
+static void *(*od_get_text)(void *, const void *)          = nullptr;
+static void  (*od_ctor_str)(void *, void *, const void *)  = nullptr;
+
+static void *(*il2cpp_object_get_class)(void *)                          = nullptr;
+static void *(*il2cpp_class_get_field_from_name)(void *, const char *)   = nullptr;
+static int   (*il2cpp_field_get_offset)(void *)                          = nullptr;
+
+// ---- List<T> / array helpers (il2cpp, 64-bit): List._items @0x10, _size @0x18; array items @0x20
+static void *ListAt(void *list, int i) {
+    void *arr = *(void **)((char *)list + 0x10);
+    return arr ? ((void **)((char *)arr + 0x20))[i] : nullptr;
+}
+static int ListSize(void *list) { return list ? *(int *)((char *)list + 0x18) : 0; }
+
+static std::string Lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char)tolower(c); });
+    return s;
+}
+static std::string OptText(void *opt) { return opt ? Lower(il2cppToStd(od_get_text(opt, nullptr))) : std::string(); }
+
+// finds "Hard" and "Golda" indexes; returns false if this is not the difficulty dropdown
+static bool ScanDropdown(void *dd, int &hard, int &golda) {
+    hard = golda = -1;
+    void *list = dd_get_options(dd, nullptr);
+    int n = ListSize(list);
+    if (!list || n <= 0 || n > 64) return false;
+    for (int i = 0; i < n; i++) {
+        std::string t = OptText(ListAt(list, i));
+        if (t == Lower(GOLDA_NAME)) golda = i;
+        else if (hard < 0 && t.find("hard") != std::string::npos && t.find("extreme") == std::string::npos) hard = i;
+    }
+    return hard >= 0;
+}
+
+static void EnsureGolda(void *dd) {
+    if (!dd) return;
+    int hard, golda;
+    if (!ScanDropdown(dd, hard, golda) || golda >= 0) return;          // not difficulty list, or already added
+    void *list = dd_get_options(dd, nullptr);
+    void *first = ListAt(list, 0);
+    void *odK = first ? il2cpp_object_get_class(first) : nullptr;      // OptionData class
+    void *listK = il2cpp_object_get_class(list);                       // List<OptionData> class
+    void *addMI = listK ? il2cpp_class_get_method_from_name(listK, "Add", 1) : nullptr;
+    if (!odK || !addMI) { LOG("Golda: cannot find OptionData/List.Add"); return; }
+    void *opt = il2cpp_object_new(odK);
+    od_ctor_str(opt, Str(GOLDA_NAME), nullptr);
+    ((void (*)(void *, void *, const void *))(*(void **)addMI))(list, opt, addMI);
+    dd_refresh(dd, nullptr);
+    LOG("Golda option added (total %d)", ListSize(list));
+
+    if (GOLDA_DEFAULT && !g_goldaAutoDone) {          // game just opened: pre-select Golda
+        g_goldaAutoDone = true;
+        hook_DD_set_value(dd, ListSize(list) - 1, nullptr);
+        LOG("Golda auto-selected on game start");
+    }
+}
+
+// ---- Dropdown hooks
+static void (*orig_DD_Start)(void *, const void *) = nullptr;
+static void hook_DD_Start(void *self, const void *mi) { orig_DD_Start(self, mi); EnsureGolda(self); }
+
+static void (*orig_DD_Show)(void *, const void *) = nullptr;
+static void hook_DD_Show(void *self, const void *mi) { EnsureGolda(self); orig_DD_Show(self, mi); }
+
+static void (*orig_DD_set_value)(void *, int, const void *) = nullptr;
+static void hook_DD_set_value(void *self, int v, const void *mi) {
+    int hard, golda;
+    if (self && ScanDropdown(self, hard, golda)) {
+        if (golda >= 0 && v == golda) {
+            g_golda = true;
+            LOG("Golda selected -> game gets Hard (%d)", hard);
+            orig_DD_set_value(self, hard, mi);          // game's callback sees "Hard"
+            dd_set_nonotify(self, golda, nullptr);      // but the dropdown keeps showing "Golda"
+            return;
+        }
+        g_golda = false;
+    }
+    orig_DD_set_value(self, v, mi);
+}
+
+// ---- Granny speed scaling
+static const char *SPEED_FIELDS[6] = {"walkSpeed", "walkAnimSpeed", "grannysFollowSpeed",
+                                      "grannysAnimFollowSpeed", "grannysVarSpeed", "grannysAnimSpeed"};
+static int  g_off[6];
+static bool g_offTried = false, g_offOk = false;
+struct GState { float last[6]; bool init = false; };
+static std::unordered_map<void *, GState> g_gstates;
+
+static void ResolveGrannyFields() {
+    g_offTried = true;
+    void *img = ImageOf("Assembly-CSharp");
+    void *k = img ? il2cpp_class_from_name(img, "", "EnemyAIGranny") : nullptr;
+    if (!k || !il2cpp_class_get_field_from_name || !il2cpp_field_get_offset) { LOG("Golda: EnemyAIGranny not found"); return; }
+    for (int i = 0; i < 6; i++) {
+        void *f = il2cpp_class_get_field_from_name(k, SPEED_FIELDS[i]);
+        if (!f) { LOG("Golda: field %s not found", SPEED_FIELDS[i]); return; }
+        g_off[i] = il2cpp_field_get_offset(f);
+    }
+    g_offOk = true;
+}
+
+static void (*orig_Granny_FixedUpdate)(void *, const void *) = nullptr;
+static void hook_Granny_FixedUpdate(void *self, const void *mi) {
+    if (g_golda && self) {
+        if (!g_offTried) ResolveGrannyFields();
+        if (g_offOk) {
+            GState &s = g_gstates[self];
+            for (int i = 0; i < 6; i++) {
+                float *p = (float *)((char *)self + g_off[i]);
+                if (!s.init || *p != s.last[i]) {        // game (re)set the value -> take it as the new Hard base
+                    s.last[i] = *p * GOLDA_MULT;
+                    *p = s.last[i];
+                }
+            }
+            s.init = true;
+        }
+    } else if (!g_golda && !g_gstates.empty()) {
+        g_gstates.clear();
+    }
+    orig_Granny_FixedUpdate(self, mi);
+}
+
+static void golda_install(uintptr_t base, void *h) {
+#define RES2(n) *(void **)&n = dlsym(h, #n)
+    RES2(il2cpp_object_get_class); RES2(il2cpp_class_get_field_from_name); RES2(il2cpp_field_get_offset);
+#undef RES2
+    dd_get_options  = (decltype(dd_get_options))(base + RVA_DD_get_options);
+    dd_set_nonotify = (decltype(dd_set_nonotify))(base + RVA_DD_SetNoNotify);
+    dd_refresh      = (decltype(dd_refresh))(base + RVA_DD_Refresh);
+    od_get_text     = (decltype(od_get_text))(base + RVA_OD_get_text);
+    od_ctor_str     = (decltype(od_ctor_str))(base + RVA_OD_ctor_str);
+
+    DobbyHook((void *)(base + RVA_DD_Start),     (void *)hook_DD_Start,     (void **)&orig_DD_Start);
+    DobbyHook((void *)(base + RVA_DD_Show),      (void *)hook_DD_Show,      (void **)&orig_DD_Show);
+    DobbyHook((void *)(base + RVA_DD_set_value), (void *)hook_DD_set_value, (void **)&orig_DD_set_value);
+    DobbyHook((void *)(base + RVA_Granny_FixedUpdate), (void *)hook_Granny_FixedUpdate, (void **)&orig_Granny_FixedUpdate);
+    LOG("Golda hooks installed");
+}
+
 // ---------------------------------------------------------------- init
 static void *init_thread(void *) {
     uintptr_t base;
@@ -818,6 +991,7 @@ static void *init_thread(void *) {
     DobbyHook((void *)(base + RVA_OnTriggerEnter), (void *)hook_OnTriggerEnter, (void **)&orig_OnTriggerEnter);
     DobbyHook((void *)(base + RVA_FPS_OnGUI),      (void *)hook_FPS_OnGUI,      (void **)&orig_FPS_OnGUI);
     DobbyHook((void *)(base + RVA_Playercaught),   (void *)hook_Playercaught,   (void **)&orig_Playercaught);
+    golda_install(base, h);                       // Golda difficulty + 2x Granny speed
     LOG("hooks installed");
     return nullptr;
 }
