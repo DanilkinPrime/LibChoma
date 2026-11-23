@@ -811,9 +811,6 @@ constexpr uintptr_t RVA_Granny_FixedUpdate = 0x14549E4; // EnemyAIGranny.FixedUp
 static const char *GOLDA_NAME = "Golda";
 static const float GOLDA_MULT = 2.0f;                  // 2x Hard mode speed
 static std::atomic<bool> g_golda{false};
-static const bool GOLDA_DEFAULT = true;                // true = Golda is selected automatically when the game opens
-static bool g_goldaAutoDone = false;
-static void hook_DD_set_value(void *self, int v, const void *mi);   // defined below
 
 static void *(*dd_get_options)(void *, const void *)       = nullptr;
 static void  (*dd_set_nonotify)(void *, int, const void *) = nullptr;
@@ -867,12 +864,6 @@ static void EnsureGolda(void *dd) {
     ((void (*)(void *, void *, const void *))(*(void **)addMI))(list, opt, addMI);
     dd_refresh(dd, nullptr);
     LOG("Golda option added (total %d)", ListSize(list));
-
-    if (GOLDA_DEFAULT && !g_goldaAutoDone) {          // game just opened: pre-select Golda
-        g_goldaAutoDone = true;
-        hook_DD_set_value(dd, ListSize(list) - 1, nullptr);
-        LOG("Golda auto-selected on game start");
-    }
 }
 
 // ---- Dropdown hooks
