@@ -868,10 +868,10 @@ static void EnsureGolda(void *dd) {
 
 // ---- Dropdown hooks
 static void (*orig_DD_Start)(void *, const void *) = nullptr;
-static void hook_DD_Start(void *self, const void *mi) { orig_DD_Start(self, mi); EnsureGolda(self); }
+static void hook_DD_Start(void *self, const void *mi) { if (orig_DD_Start) orig_DD_Start(self, mi); EnsureGolda(self); }
 
 static void (*orig_DD_Show)(void *, const void *) = nullptr;
-static void hook_DD_Show(void *self, const void *mi) { EnsureGolda(self); orig_DD_Show(self, mi); }
+static void hook_DD_Show(void *self, const void *mi) { EnsureGolda(self); if (orig_DD_Show) orig_DD_Show(self, mi); }
 
 static void (*orig_DD_set_value)(void *, int, const void *) = nullptr;
 static void hook_DD_set_value(void *self, int v, const void *mi) {
@@ -931,21 +931,34 @@ static void hook_Granny_FixedUpdate(void *self, const void *mi) {
     orig_Granny_FixedUpdate(self, mi);
 }
 
+// hook with logging + failure check: if Dobby fails, orig stays null and we must NOT keep our hook logic running
+static bool SafeHook(const char *name, uintptr_t addr, void *repl, void **orig) {
+    LOG("Golda: hooking %s @ %p ...", name, (void *)addr);      // if the log ends on this line, THIS hook crashed
+    int r = DobbyHook((void *)addr, repl, orig);
+    LOG("Golda: %s -> %d (orig=%p)", name, r, orig ? *orig : nullptr);
+    return r == 0 && orig && *orig;
+}
+
 static void golda_install(uintptr_t base, void *h) {
 #define RES2(n) *(void **)&n = dlsym(h, #n)
     RES2(il2cpp_object_get_class); RES2(il2cpp_class_get_field_from_name); RES2(il2cpp_field_get_offset);
 #undef RES2
+    if (!il2cpp_object_get_class || !il2cpp_class_get_method_from_name || !il2cpp_object_new || !il2cpp_string_new) {
+        LOG("Golda: il2cpp exports missing, Golda disabled"); return;
+    }
     dd_get_options  = (decltype(dd_get_options))(base + RVA_DD_get_options);
     dd_set_nonotify = (decltype(dd_set_nonotify))(base + RVA_DD_SetNoNotify);
     dd_refresh      = (decltype(dd_refresh))(base + RVA_DD_Refresh);
     od_get_text     = (decltype(od_get_text))(base + RVA_OD_get_text);
     od_ctor_str     = (decltype(od_ctor_str))(base + RVA_OD_ctor_str);
 
-    DobbyHook((void *)(base + RVA_DD_Start),     (void *)hook_DD_Start,     (void **)&orig_DD_Start);
-    DobbyHook((void *)(base + RVA_DD_Show),      (void *)hook_DD_Show,      (void **)&orig_DD_Show);
-    DobbyHook((void *)(base + RVA_DD_set_value), (void *)hook_DD_set_value, (void **)&orig_DD_set_value);
-    DobbyHook((void *)(base + RVA_Granny_FixedUpdate), (void *)hook_Granny_FixedUpdate, (void **)&orig_Granny_FixedUpdate);
-    LOG("Golda hooks installed");
+    // one at a time; a hook that fails to install is simply skipped (no null orig_* call -> no crash)
+    bool ok = true;
+    ok &= SafeHook("Dropdown.Start",     base + RVA_DD_Start,     (void *)hook_DD_Start,     (void **)&orig_DD_Start);
+    ok &= SafeHook("Dropdown.Show",      base + RVA_DD_Show,      (void *)hook_DD_Show,      (void **)&orig_DD_Show);
+    ok &= SafeHook("Dropdown.set_value", base + RVA_DD_set_value, (void *)hook_DD_set_value, (void **)&orig_DD_set_value);
+    ok &= SafeHook("Granny.FixedUpdate", base + RVA_Granny_FixedUpdate, (void *)hook_Granny_FixedUpdate, (void **)&orig_Granny_FixedUpdate);
+    LOG(ok ? "Golda hooks installed" : "Golda: some hooks FAILED (see log above)");
 }
 
 // ---------------------------------------------------------------- init
@@ -982,8 +995,9 @@ static void *init_thread(void *) {
     DobbyHook((void *)(base + RVA_OnTriggerEnter), (void *)hook_OnTriggerEnter, (void **)&orig_OnTriggerEnter);
     DobbyHook((void *)(base + RVA_FPS_OnGUI),      (void *)hook_FPS_OnGUI,      (void **)&orig_FPS_OnGUI);
     DobbyHook((void *)(base + RVA_Playercaught),   (void *)hook_Playercaught,   (void **)&orig_Playercaught);
-    golda_install(base, h);                       // Golda difficulty + 2x Granny speed
     LOG("hooks installed");
+    sleep(12);                                    // let the first scene finish loading before patching more code
+    golda_install(base, h);                       // Golda difficulty + 2x Granny speed
     return nullptr;
 }
 
