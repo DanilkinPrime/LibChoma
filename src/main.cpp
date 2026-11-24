@@ -36,9 +36,84 @@
 #include <chrono>
 #include <zlib.h>
 #include <cstdlib>
+#include <fcntl.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <stdarg.h>
+#include <time.h>
 #include "dobby.h"
 
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, "TeddyMod", __VA_ARGS__)
+// ---------------------------------------------------------------- file log (no logcat needed)
+// Written to: /sdcard/Android/data/<package>/files/teddymod_log.txt  (open it with any file manager)
+// Every line is written straight to disk, so it survives a crash. Log is cleared on each game start.
+static int  g_logFd = -2;                    // -2 = not opened yet, -1 = failed
+static uintptr_t g_il2cppBase = 0;
+
+static void LogOpen() {
+    if (g_logFd != -2) return;
+    g_logFd = -1;
+    char pkg[256] = {0};
+    if (FILE *f = fopen("/proc/self/cmdline", "r")) { fread(pkg, 1, sizeof pkg - 1, f); fclose(f); }
+    if (!pkg[0]) return;
+    const char *dirs[] = {"/storage/emulated/0/Android/data/%s/files", "/sdcard/Android/data/%s/files",
+                          "/data/user/0/%s/files", "/data/data/%s/files"};
+    for (auto d : dirs) {
+        char dir[400], path[480];
+        snprintf(dir, sizeof dir, d, pkg);
+        snprintf(path, sizeof path, "%s/teddymod_log.txt", dir);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd >= 0) { g_logFd = fd; return; }
+    }
+}
+
+static void TeddyLog(const char *fmt, ...) {
+    char buf[700];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, "TeddyMod", "%s", buf);
+    LogOpen();
+    if (g_logFd >= 0) {
+        char line[760];
+        time_t t = time(nullptr); struct tm tmv; localtime_r(&t, &tmv);
+        int n = snprintf(line, sizeof line, "[%02d:%02d:%02d] %s\n", tmv.tm_hour, tmv.tm_min, tmv.tm_sec, buf);
+        if (n > 0) { write(g_logFd, line, (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1)); fsync(g_logFd); }
+    }
+}
+#define LOG(...) TeddyLog(__VA_ARGS__)
+
+// crash recorder: writes signal, fault address and the il2cpp RVA of pc/lr (look the RVA up in dump.cs)
+static struct sigaction g_oldSeg, g_oldAbrt, g_oldBus, g_oldIll;
+static void CrashHandler(int sig, siginfo_t *si, void *ctx) {
+    auto *uc = (ucontext_t *)ctx;
+    uintptr_t pc = 0, lr = 0;
+#if defined(__aarch64__)
+    if (uc) { pc = (uintptr_t)uc->uc_mcontext.pc; lr = (uintptr_t)uc->uc_mcontext.regs[30]; }
+#else
+    (void)uc;
+#endif
+    LOG("!!! CRASH signal %d code %d fault_addr %p", sig, si ? si->si_code : -1, si ? si->si_addr : nullptr);
+    LOG("!!! pc=%p  lr=%p  il2cpp_base=%p", (void *)pc, (void *)lr, (void *)g_il2cppBase);
+    if (g_il2cppBase) {
+        if (pc >= g_il2cppBase && pc < g_il2cppBase + 0x6000000) LOG("!!! pc is in il2cpp, RVA 0x%lX", (unsigned long)(pc - g_il2cppBase));
+        if (lr >= g_il2cppBase && lr < g_il2cppBase + 0x6000000) LOG("!!! lr is in il2cpp, RVA 0x%lX", (unsigned long)(lr - g_il2cppBase));
+    }
+    Dl_info di{};
+    if (pc && dladdr((void *)pc, &di) && di.dli_fname) LOG("!!! pc in %s +0x%lX", di.dli_fname, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+    struct sigaction *o = sig == SIGSEGV ? &g_oldSeg : sig == SIGABRT ? &g_oldAbrt : sig == SIGBUS ? &g_oldBus : &g_oldIll;
+    sigaction(sig, o, nullptr);                       // restore the previous handler (Unity/Android) and let it handle the crash
+    if (o->sa_flags & SA_SIGINFO) { if (o->sa_sigaction) o->sa_sigaction(sig, si, ctx); }
+    else if (o->sa_handler && o->sa_handler != SIG_DFL && o->sa_handler != SIG_IGN) o->sa_handler(sig);
+    else raise(sig);
+}
+static void InstallCrashHandler() {
+    struct sigaction sa{};
+    sa.sa_sigaction = CrashHandler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_oldSeg); sigaction(SIGABRT, &sa, &g_oldAbrt);
+    sigaction(SIGBUS, &sa, &g_oldBus);  sigaction(SIGILL, &sa, &g_oldIll);
+}
 
 // on-screen status lines (shown in the menu) - so you can debug without logcat
 static char g_status[300]  = "image: idle";
@@ -963,8 +1038,11 @@ static void golda_install(uintptr_t base, void *h) {
 
 // ---------------------------------------------------------------- init
 static void *init_thread(void *) {
+    LOG("TeddyMod started (log file active)");
+    InstallCrashHandler();
     uintptr_t base;
     while ((base = getLibBase("libil2cpp.so")) == 0) sleep(1);
+    g_il2cppBase = base;
     sleep(3);
     LOG("libil2cpp base = %p", (void *)base);
 
